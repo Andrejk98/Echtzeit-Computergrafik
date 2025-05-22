@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #191919;
+        }
+
+        canvas {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="canvas" tabindex="0"></canvas>
+</body>
+
+<script>
+    // 1. "Basic" Building Blocks //////////////////////////////////////////////
+
+    /** Create a shader object from a source string.
+     *  @param gl - The WebGL context.
+     *  @param name - The name of the shader program.
+     *  @param stage - The stage of the shader, vertex- or fragment-.
+     *  @param source - The GLSL source code of the shader.
+     */
+    function createShader(
+        gl,      // WebGL2RenderingContext
+        name,    // string
+        stage,   // number/enum
+        source,  // string
+    ) {
+        // First, ensure that the shader stage is valid.
+        if (stage !== gl.VERTEX_SHADER && stage !== gl.FRAGMENT_SHADER)
+        {
+            throw new Error(`Invalid shader stage ${stage} for shader "${name}"`);
+        }
+
+        // Next, create the shader object.
+        const shader = gl.createShader(stage);
+        if (!shader)
+        {
+            throw new Error(`Failed to create shader "${name}"`);
+        }
+
+        // Upload the shader source and compile it.
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+
+        // Check for compilation errors.
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS))
+        {
+            const info = gl.getShaderInfoLog(shader);
+            gl.deleteShader(shader);
+            throw new Error(`Failed to compile shader "${name}": ${info}`);
+        }
+
+        // Return the compiled shader, wrapped in a "Shader" object.
+        return {
+            name,
+            stage,
+            source,
+            glo: shader,
+        };
+    }
+
+
+    /** Create a new Attribute Buffer Object (ABO).
+     *  @param gl - The WebGL context.
+     *  @param name - The name of the ABO.
+     *  @param attributes - The Attributes to use, consisting of a name and a description with:
+     *  @param   * `data`: The data of the attribute.
+     *  @param   * `height`: The number of dimensions of the attribute, the height of a vector/matrix.
+     *  @param   * `width`: The number of locations used by the attribute, the width of a matrix (defaults to 1).
+     *  @param   * `type`: The WebGL data type of the attribute (defaults to `gl.FLOAT`).
+     *  @param   * `normalized`: Whether integral data should be normalized (defaults to `false`).
+     *  @param usage - The usage pattern of the buffer (defaults to STATIC_DRAW).
+     */
+    function createAttributeBuffer(
+        gl,          // WebGL2RenderingContext
+        name,        // string
+        attributes,  // Record<string, {
+        //   data: number[],
+        //   height: number,
+        //   width: (number),
+        //   type: (number/enum),
+        //   normalized: (boolean),
+        // }>
+        usage,       // (number/enum)
+    ) {
+        // Validate the attributes.
+        let vertexCount = -1;
+        for (const [attributeName, attribute] of Object.entries(attributes))
+        {
+            // Width and height must be positive integers.
+            attribute.height = Math.max(1, Math.ceil(attribute.height));
+            attribute.width = attribute.width ? Math.max(1, Math.ceil(attribute.width)) : 1;
+
+            // Assign default values where needed.
+            attribute.type = attribute.type || gl.FLOAT;
+            attribute.normalized = attribute.normalized || false;
+
+            // Ensure that the data can be split into attributes without remainders.
+            const attributeSize = attribute.height * attribute.width;
+            const attributeVertexCount = attribute.data.length / attributeSize;
+            if (attributeVertexCount % 1 !== 0)
+            {
+                throw new Error(`Attribute "${attributeName}" contains an incomplete vertex`);
+            }
+
+            // All attributes must describe the same number of vertices.
+            if (vertexCount === -1)
+            {
+                vertexCount = attributeVertexCount;
+            } else if (vertexCount !== attributeVertexCount)
+            {
+                throw new Error(`Attribute buffer "${name}" has inconsistent vertex counts`);
+            }
+        }
+        if (vertexCount <= 0)
+        {
+            throw new Error(`Attribute Buffer "${name}" must have at least one attribute.`);
+        }
+
+        // Calculate the vertex stride.
+        let vertexStride = 0;
+        for (const attribute of Object.values(attributes))
+        {
+            vertexStride += attribute.height * attribute.width * byteSize(attribute.type);
+        }
+
+        // Create the JavaScript Array Buffer object to store the attribute data.
+        const arrayBuffer = new ArrayBuffer(vertexCount * vertexStride);
+
+        // Interleave the attribute data into the array buffer.
+        const dataView = new DataView(arrayBuffer);
+        let startOffset = 0;
+        for (const attribute of Object.values(attributes))
+        {
+            const scalarCount = attribute.height * attribute.width; // number of scalars for this attribute
+            const scalarByteSize = byteSize(attribute.type);        // number of bytes of a single scalar of this attribute
+            const attributeByteSize = scalarCount * scalarByteSize; // number of bytes for this attribute
+            const attributeStep = vertexStride - attributeByteSize; // distance from the end of this attribute to its next start
+
+            let byteOffset = startOffset;
+            for (let i = 0; i < attribute.data.length; i++)
+            {
+                writeData(dataView, attribute.type, byteOffset, attribute.data[i]);
+                byteOffset += scalarByteSize; // Move to the next scalar.
+                if ((i + 1) % scalarCount === 0)
+                {
+                    byteOffset += attributeStep; // Move to the next vertex.
+                }
+            }
+            startOffset += attributeByteSize;
+        }
+
+        // Create the WebGL buffer object.
+        const buffer = gl.createBuffer();
+        if (!buffer)
+        {
+            throw new Error(`Failed to create attribute buffer "${name}"`);
+        }
+
+        // Bind the buffer and upload the data.
+        usage = usage || gl.STATIC_DRAW;
+        try
+        {
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+            gl.bufferData(gl.ARRAY_BUFFER, arrayBuffer, usage);
+        }
+        catch
+        {
+            gl.deleteBuffer(buffer);
+            throw new Error(`Failed to upload data into attribute buffer "${name}"`);
+        }
+        finally
+        {
+            // Always unbind the buffer when done.
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        }
+
+        // Return the attribute buffer object.
+        return {
+            name,
+            size: vertexCount,
+            attributes,
+            usage,
+            glo: buffer,
+        };
+    }
+
+
+    /** Create a new Index Buffer Object (IBO).
+     *  @param gl - The WebGL context.
+     *  @param name - The name of the IBO.
+     *  @param indices - A JavaScript array containing the indices.
+     *  @param usage - The usage pattern of the buffer (defaults to STATIC_DRAW).
+     */
+    function createIndexBuffer(
+        gl,       // WebGL2RenderingContext
+        name,     // string
+        indices,  // number[]
+        usage,    // (number/enum)
+    ) {
+        // Ensure that the indicies are valid.
+        if (indices.length % 3 !== 0)
+        {
+            throw new Error(`Index buffer "${name}" size must be a multiple of 3.`);
+        }
+        if (indices.length === 0)
+        {
+            throw new Error(`Index buffer "${name}" must have at least one index.`);
+        }
+
+        // Find the highest index.
+        let highestIndex = 0;
+        for (const index of indices)
+        {
+            highestIndex = Math.max(highestIndex, index);
+        }
+
+        // Determine the best data type for the index buffer.
+        let type;
+        if (highestIndex < 256)
+        {  // 2^8
+            type = gl.UNSIGNED_BYTE;
+        }
+        else if (highestIndex < 65536)
+        {  // 2^16
+            type = gl.UNSIGNED_SHORT;
+        }
+        else if (highestIndex < 4294967296)
+        {  // 2^32
+            type = gl.UNSIGNED_INT;
+        }
+        else
+        {
+            throw new Error(`Index ${highestIndex} does not fit in a 32-bit unsigned integer.`);
+        }
+
+        // Create the data array.
+        let data;
+        switch (type)
+        {
+            case (gl.UNSIGNED_BYTE):
+                data = new Uint8Array(indices);
+                break;
+            case (gl.UNSIGNED_SHORT):
+                data = new Uint16Array(indices);
+                break;
+            case (gl.UNSIGNED_INT):
+                data = new Uint32Array(indices);
+                break;
+        }
+
+        // Create the buffer.
+        const buffer = gl.createBuffer();
+        if (!buffer)
+        {
+            throw new Error(`Failed to create index buffer "${name}"`);
+        }
+
+        // Bind the buffer and upload the data.
+        usage = usage || gl.STATIC_DRAW;
+        try
+        {
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffer);
+            gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, data, usage);
+        }
+        catch
+        {
+            gl.deleteBuffer(buffer);
+            throw new Error(`Failed to upload data into index buffer "${name}"`);
+        }
+        finally
+        {
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+        }
+
+        // Return the buffer information.
+        return {
+            type,
+            size: indices.length,
+            usage,
+            glo: buffer,
+        };
+    }
+
+    // 2. "Compound" Building Blocks ///////////////////////////////////////////
+
+    /** Create a shader program from a vertex and fragment shader.
+     *  @param gl - The WebGL context.
+     *  @param name - The name of the shader program.
+     *  @param vertex - The vertex shader.
+     *  @param fragment - The fragment shader.
+     */
+    function createProgram(
+        gl,        // WebGL2RenderingContext
+        name,      // string
+        vertex,    // Shader
+        fragment,  // Shader
+    ) {
+        // Check the shader stages.
+        if (!gl.isShader(vertex.glo) || vertex.stage !== gl.VERTEX_SHADER)
+        {
+            throw new Error(`Invalid vertex shader for program "${name}"`);
+        }
+        if (!gl.isShader(fragment.glo) || fragment.stage !== gl.FRAGMENT_SHADER)
+        {
+            throw new Error(`Invalid fragment shader for program "${name}"`);
+        }
+
+        // Create the program object.
+        const program = gl.createProgram();
+        if (!program)
+        {
+            throw new Error(`Failed to create program "${name}"`);
+        }
+
+        // Attach the shaders and link the program.
+        gl.attachShader(program, vertex.glo);
+        gl.attachShader(program, fragment.glo);
+        gl.linkProgram(program);
+
+        // Check for linking errors.
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS))
+        {
+            const info = gl.getProgramInfoLog(program);
+            gl.deleteProgram(program);
+            throw new Error(`Failed to link program "${name}": ${info}`);
+        }
+
+        // Return the linked program, wrapped in a "Program" object.
+        const result = {
+            name,
+            vertex,
+            fragment,
+            glo: program,
+            attributes: {},
+            uniforms: {},
+        };
+        result.attributes = findAttributes(gl, result);
+        result.uniforms = findUniforms(gl, result);
+        return result;
+    }
+
+
+    /** Create a Vertex Array Object (VAO) from a shader program,
+     *    an index buffer and one or more attribute buffers.
+     *  @param gl - The WebGL context.
+     *  @param name-  The name of the vao.
+     *  @param ibo - The index buffer required for the draw call.
+     *  @param attributes - All attribute buffers that provide input to the shader program.
+     *  @param program - The shader program for the draw call.
+     */
+    function createVertexArrayObject(
+        gl,       // WebGL2RenderingContext
+        name,     // string
+        ibo,      // IndexBuffer
+        abos,     // AttributeBuffer[]
+        program,  // Program
+    ) {
+        // Create the Vertex Array Object.
+        const vao = gl.createVertexArray();
+        if (!vao)
+        {
+            throw new Error(`Failed to create VAO "${name}"`);
+        }
+
+        // Define the VAO.
+        try
+        {
+            // Bind the VAO.
+            gl.bindVertexArray(vao);
+
+            // Bind the index buffer.
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo.glo);
+
+            // Normalize single values to an array.
+            abos = Array.isArray(abos) ? abos : [abos];
+
+            // Go through all attribute buffers and match them with attributes
+            // in the shader program.
+            for (const attributeBuffer of abos)
+            {
+
+                // Bind the attribute buffer.
+                gl.bindBuffer(gl.ARRAY_BUFFER, attributeBuffer.glo);
+
+                // Calculate the vertex stride of the buffer.
+                let stride = 0;
+                for (const bufferAttribute of Object.values(attributeBuffer.attributes))
+                {
+                    stride += bufferAttribute.height * bufferAttribute.width * byteSize(bufferAttribute.type);
+                }
+
+                // Go through all attributes in the buffer.
+                let nextAttributeOffset = 0;
+                for (const [attributeName, bufferAttribute] of Object.entries(attributeBuffer.attributes))
+                {
+
+                    // Calculate the offset of the attribute.
+                    const offset = nextAttributeOffset;
+                    nextAttributeOffset += bufferAttribute.height * bufferAttribute.width * byteSize(bufferAttribute.type);
+
+                    // Find the attribute in the shader program.
+                    const shaderAttribute = program.attributes[attributeName];
+                    if (!shaderAttribute)
+                    {
+                        continue; // Skip attributes not used in the program.
+                    }
+
+                    // These things are possible, but not supported yet in glance-dev.
+                    if (bufferAttribute.width > 1)
+                    {
+                        throw new Error("Matrix attributes are not yet supported in glance-dev");
+                    }
+                    if (bufferAttribute.type !== gl.FLOAT)
+                    {
+                        throw new Error("Attribute types other than floats are not yet supported in glance-dev");
+                    }
+
+                    // Enable the attribute and define its layout.
+                    gl.enableVertexAttribArray(shaderAttribute.location);
+                    gl.vertexAttribPointer(
+                        shaderAttribute.location,
+                        bufferAttribute.height,
+                        bufferAttribute.type,
+                        bufferAttribute.normalized,
+                        stride,
+                        offset,
+                    );
+                }
+            }
+        }
+
+        // Report any errors.
+        catch (error)
+        {
+            gl.bindVertexArray(null);
+            gl.deleteVertexArray(vao);
+            throw error;
+        }
+
+        // Reset the WebGL state.
+        finally
+        {
+            // Unbind the VAO before unbiding the IBO, so the VAO remembers the IBO.
+            gl.bindVertexArray(null);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+        }
+
+        // Return the Vertex Array Object with additional data.
+        return {
+            name,
+            ibo,
+            program,
+            glo: vao,
+        };
+    }
+
+    // 3. Draw Call ////////////////////////////////////////////////////////////
+
+    /** Create a new Draw Call, which is a collection of everything required to
+     *    draw geometry using a given shader.
+     *  @param gl - The WebGL context.
+     *  @param name-  The name of the draw call.
+     *  @param vao - The vertex array object to bind for this draw call.
+     *  @param count - The number of indices to draw (defaults to the entire IBO).
+     *  @param offset - Offset into the IBO (defaults to 0).
+     */
+    function createDrawCall(
+        gl,          // WebGL2RenderingContext
+        name,        // string,
+        vao,         // VAO,
+        program,     // Program,
+        count = -1,  // (number),
+        offset = 0,  // (number),
+    ) {
+        // The draw call is simply a collection of values used in `draw()`.
+        return {
+            name,
+            vao,
+            program,
+            count: count < 0 ? vao.ibo.size : count,
+            offset,
+            uniform: {},
+        };
+    }
+
+
+    /** Execute a Draw Call
+     *  @param gl - The WebGL context.
+     *  @param drawCall - The Draw Call.
+     */
+    function draw(
+        gl,        // WebGL2RenderingContext
+        drawCall,  // DrawCall
+    ) {
+        try
+        {
+            // Use the program and VAO.
+            gl.useProgram(drawCall.program.glo);
+            gl.bindVertexArray(drawCall.vao.glo);
+
+            // Update the draw call's uniform values.
+            for (const [uniformName, uniformValue] of Object.entries(drawCall.uniform))
+            {
+                const uniform = drawCall.program.uniforms[uniformName];
+                if (!uniform)
+                {
+                    throw new Error(`Uniform "${uniformName}" not found in program "${drawCall.program.name}"`);
+                }
+                uploadUniform(gl, uniform, uniformValue);
+            }
+
+            // Perform the draw call.
+            gl.drawElements(gl.TRIANGLES, drawCall.count, drawCall.vao.ibo.type, drawCall.offset);
+        }
+
+        // Reset the WebGL state.
+        finally
+        {
+            gl.useProgram(null);
+            gl.bindVertexArray(null);
+        }
+    }
+
+    // 4. Helper ///////////////////////////////////////////////////////////////
+
+    /** Get the number of bytes used to store a given data type.
+     *  @param type - Data type to test.
+     */
+    function byteSize(type) {
+        switch (type)
+        {
+            case (gl.BYTE):
+            case (gl.UNSIGNED_BYTE):
+                return 1;
+            case (gl.SHORT):
+            case (gl.UNSIGNED_SHORT):
+                return 2;
+            case (gl.INT):
+            case (gl.UNSIGNED_INT):
+            case (gl.FLOAT):
+                return 4;
+            default:
+                throw new Error(`Invalid data type ${type}".`);
+        }
+    }
+
+
+    /** Write arbitrary data into a DataView.
+     *  @param dataView - DataView to write into.
+     *  @param type - WebGL data type to write.
+     *  @param byteOffset - Offset in bytes into the DataView.
+     *  @param data - Data to write.
+     */
+    function writeData(dataView, type, byteOffset, data) {
+        switch (type)
+        {
+            case (gl.BYTE):
+                return dataView.setInt8(byteOffset, data);
+            case (gl.UNSIGNED_BYTE):
+                return dataView.setUint8(byteOffset, data);
+            case (gl.SHORT):
+                return dataView.setInt16(byteOffset, data, true);
+            case (gl.UNSIGNED_SHORT):
+                return dataView.setUint16(byteOffset, data, true);
+            case (gl.INT):
+                return dataView.setInt32(byteOffset, data, true);
+            case (gl.UNSIGNED_INT):
+                return dataView.setUint32(byteOffset, data, true);
+            case (gl.FLOAT):
+                return dataView.setFloat32(byteOffset, data, true);
+            default:
+                throw new Error(`Invalid data type ${type}".`);
+        }
+    }
+
+
+    /** Find all attributes in a compiled shader program.
+     *  @param gl - The WebGL context.
+     *  @param program - The Program object to inspect.
+     */
+    function findAttributes(gl, program) {
+        // Simple regular expression to detect attribute declarations.
+        const regex = /^\s*(?:layout\s*\(location\s*=\s*\d+\)\s*)?in\s+(?:(?<precision>lowp|mediump|highp)\s+)?(?<type>\w+)\s+(?<name>\w+)\s*;/gm;
+
+        // Start with an empty result object.
+        const result = {};
+
+        // Find attributes in the vertex shader.
+        let match;
+        while ((match = regex.exec(program.vertex.source)) !== null)
+        {
+
+            // Extract the attribute information from the source.
+            const { name, type, precision } = match.groups;
+
+            // Skip attributes that are not used in the program.
+            const location = gl.getAttribLocation(program.glo, name);
+            if (location < 0)
+            {
+                continue;
+            }
+
+            // Store the attribute information.
+            result[name] = { type, location, precision };
+        }
+
+        // Return the (potentially empty) result.
+        return result;
+    }
+
+
+    /** Find all uniforms in a compiled shader program.
+     *  @param gl - The WebGL context.
+     *  @param program - The Program object to inspect.
+     */
+    function findUniforms(gl, program) {
+        // Simple regular expression to detect uniform declarations.
+        const regex = /^\s*uniform\s+(?<precision>lowp|mediump|highp)?\s*(?<type>\w+)\s+(?<name>\w+)(?:\s*\[\s*(?<sizeString>\d+)\s*\])?\s*;/gm;
+
+        // Start with an empty result object.
+        const result = {};
+
+        // Find uniforms in both the vertex and fragment shaders.
+        let match;
+        for (const source of [program.vertex.source, program.fragment.source])
+        {
+            while ((match = regex.exec(source)) !== null)
+            {
+
+                // Extract the uniform information from the source.
+                const { name, type, precision, sizeString } = match.groups;
+
+                // Skip known uniforms.
+                if (Object.hasOwn(result, name))
+                {
+                    continue;
+                }
+
+                // Skip uniforms that are not used in the program.
+                const location = gl.getUniformLocation(program.glo, name);
+                if (!location)
+                {
+                    continue;
+                }
+
+                // Non-array uniforms are always size 1.
+                const size = sizeString ? parseInt(sizeString) : 1;
+
+                // Store the uniform information.
+                result[name] = {
+                    type,
+                    location,
+                    size,
+                    precision,
+                };
+            }
+        }
+
+        // Return the (potentially empty) result.
+        return result;
+    }
+
+
+    /** Uploads a uniform to the GPU.
+     *  The shader program containing the uniform must be in use when calling this function.
+     *  @param gl - The WebGL context.
+     *  @param uniform - The Uniform object, as created by `findUniforms`.
+     *  @param value - The value to upload.
+     */
+    function uploadUniform(gl, uniform, value) {
+        switch (uniform.type)
+        {
+            case 'float':
+                return gl.uniform1f(uniform.location, value);
+            case 'vec2':
+                return gl.uniform2fv(uniform.location, value);
+            case 'vec3':
+                return gl.uniform3fv(uniform.location, value);
+            case 'vec4':
+                return gl.uniform4fv(uniform.location, value);
+            case 'mat2':
+            case 'mat2x2':
+                return gl.uniformMatrix2fv(uniform.location, false, value);
+            case 'mat3':
+            case 'mat3x3':
+                return gl.uniformMatrix3fv(uniform.location, false, value);
+            case 'mat4':
+            case 'mat4x4':
+                return gl.uniformMatrix4fv(uniform.location, false, value);
+            case 'int':
+            case 'sampler2D':
+            case 'samplerCube':
+            case 'sampler2DShadow':
+                return gl.uniform1i(uniform.location, value);
+            default:
+                throw new Error(`Unsupported value type of uniform at location ${uniform.location}.`);
+        }
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+
+    // WebGL context
+    const canvas = document.getElementById('canvas');
+    const gl = canvas.getContext('webgl2', {
+        alpha: true,
+        premultipliedAlpha: false,
+    });
+
+    // Render Loop.
+    function setRenderLoop(callback) {
+        const timeAtStart = performance.now();
+        let lastTime = timeAtStart;
+        function renderLoop(lastFrameEndTime) {
+            const globalTime = lastFrameEndTime - performance.timeOrigin;
+            const localTime = lastFrameEndTime - timeAtStart;
+            const deltaTime = Math.max(0.000001, localTime - lastTime); // never zero
+            lastTime = localTime;
+            callback({ time: localTime, globalTime, deltaTime });
+            requestAnimationFrame(renderLoop);
+        }
+        requestAnimationFrame(renderLoop);
+    }
+
+    // 1. Data /////////////////////////////////////////////////////////////////
+
+    // Vertex Shader Source
+    const vertexShaderSource = `#version 300 es
+    precision highp float;
+    in vec2 a_pos;
+    in vec3 a_color;
+
+    out vec4 v_color;
+    out vec2 v_uv;
+
+    void main() {
+        gl_Position = vec4(a_pos, 0.0, 1.0);
+        v_color = vec4(a_color, 1);
+        v_uv = a_pos;
+    }`;
+
+    // Fragment Shader Source
+    const fragmentShaderSource = `#version 300 es
+    precision mediump float;
+    uniform float u_time;
+
+    in vec4 v_color;
+    in vec2 v_uv;
+
+    out vec4 o_fragColor;
+
+    void main() {
+        float distance = sin(length(v_uv) * 8. - u_time * 0.0005) / 8.;
+        float activation = smoothstep(0.0, 0.1, abs(distance));
+        o_fragColor = activation * v_color;
+    }`;
+
+    // Attributes
+    const attributes = {
+        a_pos: {
+            data: [
+                -1, -1,
+                +1, -1,
+                -1, +1,
+                +1, +1,
+            ],
+            height: 2
+        },
+        a_color: {
+            data: [
+                1, 0, 0,
+                0, 1, 0,
+                0, 0, 1,
+                1, 1, 1,
+            ],
+            height: 3,
+        }
+    };
+
+    // Indices
+    const indices = [0, 1, 2, 1, 3, 2];
+
+    // 2. WebGL "Building Blocks" //////////////////////////////////////////////
+
+    // Basic
+    const vs = createShader(gl, "my vertex shader", gl.VERTEX_SHADER, vertexShaderSource);
+    const fs = createShader(gl, "my fragment shader", gl.FRAGMENT_SHADER, fragmentShaderSource);
+    const abo = createAttributeBuffer(gl, "my abo", attributes);
+    const ibo = createIndexBuffer(gl, "my ibo", indices);
+
+    // Compound
+    const program = createProgram(gl, "my program", vs, fs);
+    const vao = createVertexArrayObject(gl, "my vao", ibo, abo, program);
+
+    // Draw Call
+    const quad = createDrawCall(gl, "my draw call", vao, program);
+
+    // 3. Render Loop //////////////////////////////////////////////////////////
+
+    function myRenderLoop({ time }) {
+        quad.uniform.u_time = time;
+        draw(gl, quad);
+    }
+    setRenderLoop(myRenderLoop);
+
+</script>
+
+</html>
